@@ -1,0 +1,12 @@
+{
+  "bot_start_date": "2024-05-01",
+  "roles":[
+    {"name": "皆勤賞🥇", "min_percent": 100},
+    {"name": "出席率80%以上🥈", "min_percent": 80},
+    {"name": "出席率60%以上🥉", "min_percent": 60}
+  ],
+  "exclude_days": {
+    "weekdays": [5, 6],
+    "holidays":["2024-05-03", "2024-05-04", "2024-05-05"]
+  }
+}
