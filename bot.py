@@ -37,7 +37,7 @@ class AttendanceBot(commands.Bot):
         # スラッシュコマンドの同期
         await self.tree.sync()
         # 0時バッチ処理のスケジュール登録 (JST 0:00)
-        self.scheduler.add_job(self.midnight_batch_process, CronTrigger(hour=0, minute=0, timezone=JST))
+        self.scheduler.add_job(midnight_batch_process, CronTrigger(hour=0, minute=0, timezone=JST))
         self.scheduler.start()
         
         # [リカバリ処理] Botダウン中に0時を過ぎた場合の補正などを行えますが、
