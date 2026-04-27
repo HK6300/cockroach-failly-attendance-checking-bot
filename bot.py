@@ -37,12 +37,9 @@ class AttendanceBot(commands.Bot):
         # スラッシュコマンドの同期
         await self.tree.sync()
         # 0時バッチ処理のスケジュール登録 (JST 0:00)
+        # ※以前のエラーを修正済み（self. を削除しました）
         self.scheduler.add_job(midnight_batch_process, CronTrigger(hour=0, minute=0, timezone=JST))
         self.scheduler.start()
-        
-        # [リカバリ処理] Botダウン中に0時を過ぎた場合の補正などを行えますが、
-        # 今回は無料枠での即時復旧を優先し、起動時点でVCにいる人のjoin_timeを更新します。
-        # (厳密にはここで現在のVC参加者をスキャンしDBと照合する処理が理想ですが、ここでは割愛しDB依存とします)
 
 bot = AttendanceBot()
 
@@ -70,25 +67,20 @@ async def on_voice_state_update(member, before, after):
                 duration = int((now - join_time).total_seconds() // 60)
                 await bot.db.add_daily_time(member.id, member.guild.id, now.date(), duration)
             else:
-                # 入室日と退室日が異なる場合（本来は0時バッチで処理されるが、Botダウン等の保険）
-                # 入室日から0時まで
+                # 入室日と退室日が異なる場合（0時またぎ）
                 end_of_join_day = datetime.combine(join_time.date() + timedelta(days=1), datetime.min.time(), tzinfo=JST)
                 duration_day1 = int((end_of_join_day - join_time).total_seconds() // 60)
                 await bot.db.add_daily_time(member.id, member.guild.id, join_time.date(), duration_day1)
                 
-                # 0時から退室まで
                 start_of_leave_day = datetime.combine(now.date(), datetime.min.time(), tzinfo=JST)
                 duration_day2 = int((now - start_of_leave_day).total_seconds() // 60)
                 await bot.db.add_daily_time(member.id, member.guild.id, now.date(), duration_day2)
 
             await bot.db.remove_vc_join(member.id)
 
-    # チャンネル移動・ミュート等の状態変化（VC内に留まっている場合）は何もしない
-
-
 # --- 0時バッチ処理 ---
 async def midnight_batch_process():
-    now = datetime.now(JST) # 0:00 just
+    now = datetime.now(JST)
     yesterday = (now - timedelta(days=1)).date()
 
     # 1. 0時またぎのVC滞在時間精算
@@ -98,7 +90,6 @@ async def midnight_batch_process():
         guild_id = record['guild_id']
         join_time = record['join_time'].astimezone(JST)
 
-        # 昨日分の時間を計算して加算
         duration = int((now - join_time).total_seconds() // 60)
         await bot.db.add_daily_time(user_id, guild_id, yesterday, duration)
         
@@ -106,7 +97,6 @@ async def midnight_batch_process():
         await bot.db.set_vc_join(user_id, guild_id, now)
 
     # 2. 全ユーザーのロール更新処理
-    # (注意: 全ギルド、全メンバーをループするため大規模サーバーでは非同期タスク分割が必要)
     for guild in bot.guilds:
         threshold = await bot.db.get_threshold(guild.id)
         for member in guild.members:
@@ -130,10 +120,23 @@ def get_total_valid_days(start_date: date, end_date: date) -> int:
     return valid_days
 
 async def calculate_attendance(member: discord.Member, guild: discord.Guild, target_date: date, threshold: int):
-    # 開始日の決定（Bot導入日 or ユーザー参加日の遅い方）
+    # DBから全出席記録を取得
+    records = await bot.db.get_user_attendance(member.id, guild.id)
+
+    # Bot導入日
     bot_start = datetime.strptime(CONFIG['bot_start_date'], "%Y-%m-%d").date()
+    # 現在のサーバー参加日
     member_join = member.joined_at.astimezone(JST).date() if member.joined_at else bot_start
-    start_date = max(bot_start, member_join)
+
+    # ★再参加者対策: DBに過去の記録があれば、その中で一番古い日付を取得し、開始日を補正する
+    if records:
+        oldest_record_date = min(r['record_date'] for r in records)
+        member_start = min(member_join, oldest_record_date)
+    else:
+        member_start = member_join
+
+    # 開始日の決定（Bot導入日 or ユーザーの初回参加日の遅い方）
+    start_date = max(bot_start, member_start)
 
     # 参加前なら計算不可
     if target_date < start_date:
@@ -143,15 +146,13 @@ async def calculate_attendance(member: discord.Member, guild: discord.Guild, tar
     if total_valid_days == 0:
         return 0, 0, 0
 
-    records = await bot.db.get_user_attendance(member.id, guild.id)
     attended_days = 0
-
     weekdays_exclude = CONFIG['exclude_days']['weekdays']
     holidays_exclude = [datetime.strptime(d, "%Y-%m-%d").date() for d in CONFIG['exclude_days']['holidays']]
 
     for r in records:
         r_date = r['record_date']
-        # 休日の記録は無視する（100%超えバグ防止）
+        # 休日の記録は無視する（分母にも分子にも入れない）
         if r_date.weekday() in weekdays_exclude or r_date in holidays_exclude:
             continue
         if r_date < start_date or r_date > target_date:
@@ -170,16 +171,14 @@ async def calculate_attendance(member: discord.Member, guild: discord.Guild, tar
 async def update_member_role(member: discord.Member, guild: discord.Guild, target_date: date, threshold: int):
     rate, _, _ = await calculate_attendance(member, guild, target_date, threshold)
 
-    # 付与すべきロールを判定
     target_role_name = None
     for role_cfg in sorted(CONFIG['roles'], key=lambda x: x['min_percent'], reverse=True):
         if rate >= role_cfg['min_percent']:
             target_role_name = role_cfg['name']
             break
 
-    # Discordサーバー上のロールオブジェクトを取得
     all_role_names = [r['name'] for r in CONFIG['roles']]
-    roles_to_remove =[]
+    roles_to_remove = []
     role_to_add = None
 
     for r in guild.roles:
@@ -189,12 +188,11 @@ async def update_member_role(member: discord.Member, guild: discord.Guild, targe
             else:
                 roles_to_remove.append(r)
 
-    # 権限エラーを避けるため、try-exceptで囲む
     try:
         if roles_to_remove:
-            await member.remove_roles(*roles_to_remove, reason="出席率バッチ処理: 古いロールの剥奪")
+            await member.remove_roles(*roles_to_remove, reason="出席率バッチ処理")
         if role_to_add and role_to_add not in member.roles:
-            await member.add_roles(role_to_add, reason="出席率バッチ処理: 新しいロールの付与")
+            await member.add_roles(role_to_add, reason="出席率バッチ処理")
     except discord.Forbidden:
         print(f"ロール変更権限がありません: {guild.name}")
 
@@ -238,10 +236,18 @@ async def override_attendance(interaction: discord.Interaction, target_user: dis
         await interaction.response.send_message("❌ 日付の形式が正しくありません。`YYYY-MM-DD` で入力してください。", ephemeral=True)
         return
 
-    # 日付の検証（導入日・参加日以前のチェック）
+    # ★ここでも再参加者対策の開始日補正を行う
+    records = await bot.db.get_user_attendance(target_user.id, interaction.guild.id)
     bot_start = datetime.strptime(CONFIG['bot_start_date'], "%Y-%m-%d").date()
     member_join = target_user.joined_at.astimezone(JST).date() if target_user.joined_at else bot_start
-    start_date = max(bot_start, member_join)
+
+    if records:
+        oldest_record_date = min(r['record_date'] for r in records)
+        member_start = min(member_join, oldest_record_date)
+    else:
+        member_start = member_join
+
+    start_date = max(bot_start, member_start)
 
     if date_obj < start_date:
         await interaction.response.send_message("❌ 参加前、またはBot導入前の日付のため変更できません。", ephemeral=True)
@@ -249,7 +255,6 @@ async def override_attendance(interaction: discord.Interaction, target_user: dis
 
     await bot.db.set_override(target_user.id, interaction.guild.id, date_obj, status.value)
     
-    # ロールの即時再計算
     threshold = await bot.db.get_threshold(interaction.guild.id)
     await update_member_role(target_user, interaction.guild, datetime.now(JST).date(), threshold)
 
