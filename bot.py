@@ -200,17 +200,26 @@ async def update_member_role(member: discord.Member, guild: discord.Guild, targe
 # --- スラッシュコマンド ---
 @bot.tree.command(name="attendance", description="現在の出席率を確認します")
 async def attendance(interaction: discord.Interaction, target_user: discord.Member = None):
+    # 処理に少し時間がかかる可能性があるため、先に「考え中」状態にしてエラーを防ぐ
+    await interaction.response.defer()
+
     user = target_user or interaction.user
     today = datetime.now(JST).date()
     threshold = await bot.db.get_threshold(interaction.guild.id)
     
+    # ★追加: コマンド実行時に、そのユーザーのロール更新処理を即時実行する
+    await update_member_role(user, interaction.guild, today, threshold)
+
+    # ロール更新後に計算結果を取得して表示
     rate, attended, total = await calculate_attendance(user, interaction.guild, today, threshold)
     
     embed = discord.Embed(title=f"📊 {user.display_name} の出席率", color=discord.Color.blue())
     embed.add_field(name="出席率", value=f"**{rate:.1f}%**", inline=False)
     embed.add_field(name="出席日数 / 総日数", value=f"{attended}日 / {total}日", inline=False)
     embed.set_footer(text=f"規定時間: 1日{threshold}分以上")
-    await interaction.response.send_message(embed=embed)
+    
+    # defer() を使った場合は followup.send で送信する
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="set_threshold", description="【管理者用】出席判定の規定時間(分)を変更します")
