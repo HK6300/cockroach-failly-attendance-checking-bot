@@ -32,12 +32,8 @@ class AttendanceBot(commands.Bot):
         self.scheduler = AsyncIOScheduler(timezone=JST)
 
     async def setup_hook(self):
-        # DB接続
         await self.db.connect()
-        # スラッシュコマンドの同期
         await self.tree.sync()
-        # 0時バッチ処理のスケジュール登録 (JST 0:00)
-        # ※以前のエラーを修正済み（self. を削除しました）
         self.scheduler.add_job(midnight_batch_process, CronTrigger(hour=0, minute=0, timezone=JST))
         self.scheduler.start()
 
@@ -51,23 +47,19 @@ async def on_voice_state_update(member, before, after):
 
     now = datetime.now(JST)
 
-    # 入室した時（前がNone、後がVC）
     if before.channel is None and after.channel is not None:
         await bot.db.set_vc_join(member.id, member.guild.id, now)
 
-    # 退室した時（前がVC、後がNone）
     elif before.channel is not None and after.channel is None:
         records = await bot.db.get_all_current_vc()
         user_record = next((r for r in records if r['user_id'] == member.id), None)
         
         if user_record:
             join_time = user_record['join_time'].astimezone(JST)
-            # 同じ日に退室した場合
             if join_time.date() == now.date():
                 duration = int((now - join_time).total_seconds() // 60)
                 await bot.db.add_daily_time(member.id, member.guild.id, now.date(), duration)
             else:
-                # 入室日と退室日が異なる場合（0時またぎ）
                 end_of_join_day = datetime.combine(join_time.date() + timedelta(days=1), datetime.min.time(), tzinfo=JST)
                 duration_day1 = int((end_of_join_day - join_time).total_seconds() // 60)
                 await bot.db.add_daily_time(member.id, member.guild.id, join_time.date(), duration_day1)
@@ -80,10 +72,10 @@ async def on_voice_state_update(member, before, after):
 
 # --- 0時バッチ処理 ---
 async def midnight_batch_process():
+    print(f"\n--- [0時バッチ処理開始] {datetime.now(JST)} ---")
     now = datetime.now(JST)
     yesterday = (now - timedelta(days=1)).date()
 
-    # 1. 0時またぎのVC滞在時間精算
     current_vc_users = await bot.db.get_all_current_vc()
     for record in current_vc_users:
         user_id = record['user_id']
@@ -92,22 +84,20 @@ async def midnight_batch_process():
 
         duration = int((now - join_time).total_seconds() // 60)
         await bot.db.add_daily_time(user_id, guild_id, yesterday, duration)
-        
-        # 新しい入室時刻を0時0分としてDBを更新（仮想的な再入室）
         await bot.db.set_vc_join(user_id, guild_id, now)
 
-    # 2. 全ユーザーのロール更新処理
     for guild in bot.guilds:
         threshold = await bot.db.get_threshold(guild.id)
         for member in guild.members:
             if member.bot:
                 continue
+            # バッチ処理時はログを標準出力に流す
             await update_member_role(member, guild, yesterday, threshold)
+    print("--- [0時バッチ処理終了] ---\n")
 
 
 # --- 出席率計算・ロール更新ロジック ---
 def get_total_valid_days(start_date: date, end_date: date) -> int:
-    """開始日から終了日までのうち、休日を除外した有効日数を計算"""
     valid_days = 0
     current = start_date
     weekdays_exclude = CONFIG['exclude_days']['weekdays']
@@ -120,25 +110,18 @@ def get_total_valid_days(start_date: date, end_date: date) -> int:
     return valid_days
 
 async def calculate_attendance(member: discord.Member, guild: discord.Guild, target_date: date, threshold: int):
-    # DBから全出席記録を取得
     records = await bot.db.get_user_attendance(member.id, guild.id)
-
-    # Bot導入日
     bot_start = datetime.strptime(CONFIG['bot_start_date'], "%Y-%m-%d").date()
-    # 現在のサーバー参加日
     member_join = member.joined_at.astimezone(JST).date() if member.joined_at else bot_start
 
-    # ★再参加者対策: DBに過去の記録があれば、その中で一番古い日付を取得し、開始日を補正する
     if records:
         oldest_record_date = min(r['record_date'] for r in records)
         member_start = min(member_join, oldest_record_date)
     else:
         member_start = member_join
 
-    # 開始日の決定（Bot導入日 or ユーザーの初回参加日の遅い方）
     start_date = max(bot_start, member_start)
 
-    # 参加前なら計算不可
     if target_date < start_date:
         return 0, 0, 0
 
@@ -152,7 +135,6 @@ async def calculate_attendance(member: discord.Member, guild: discord.Guild, tar
 
     for r in records:
         r_date = r['record_date']
-        # 休日の記録は無視する（分母にも分子にも入れない）
         if r_date.weekday() in weekdays_exclude or r_date in holidays_exclude:
             continue
         if r_date < start_date or r_date > target_date:
@@ -169,7 +151,10 @@ async def calculate_attendance(member: discord.Member, guild: discord.Guild, tar
     return min(rate, 100.0), attended_days, total_valid_days
 
 async def update_member_role(member: discord.Member, guild: discord.Guild, target_date: date, threshold: int):
-    rate, _, _ = await calculate_attendance(member, guild, target_date, threshold)
+    """
+    メンバーのロールを更新し、結果と詳細なログメッセージを返す
+    """
+    rate, attended, total = await calculate_attendance(member, guild, target_date, threshold)
 
     target_role_name = None
     for role_cfg in sorted(CONFIG['roles'], key=lambda x: x['min_percent'], reverse=True):
@@ -180,45 +165,84 @@ async def update_member_role(member: discord.Member, guild: discord.Guild, targe
     all_role_names = [r['name'] for r in CONFIG['roles']]
     roles_to_remove = []
     role_to_add = None
+    server_has_target_role = False
 
     for r in guild.roles:
         if r.name in all_role_names:
             if r.name == target_role_name:
                 role_to_add = r
+                server_has_target_role = True
             else:
                 roles_to_remove.append(r)
 
+    # --- ログメッセージ構築開始 ---
+    log_messages = []
+    log_messages.append(f"対象ロール: {target_role_name or '該当なし'}")
+
+    if target_role_name and not server_has_target_role:
+        log_messages.append(f"⚠️ エラー: '{target_role_name}' という名前のロールがサーバーに存在しません。config.jsonと完全に一致しているか確認してください。")
+
+    # 実際に剥奪・付与が必要なロールだけを抽出
+    actual_roles_to_remove = [r for r in roles_to_remove if r in member.roles]
+    needs_update = False
+
+    if actual_roles_to_remove:
+        needs_update = True
+    if role_to_add and role_to_add not in member.roles:
+        needs_update = True
+
+    if not needs_update:
+        if target_role_name and server_has_target_role:
+            log_messages.append("ℹ️ ロールの変更は不要です (既に付与済み)")
+        elif not target_role_name:
+            log_messages.append("ℹ️ ロールの変更は不要です (基準に未達)")
+        
+        final_log = "\n".join(log_messages)
+        print(f"[{member.display_name}] {final_log}")
+        return rate, attended, total, final_log
+
+    # --- 実際のロール付与・剥奪処理 ---
     try:
-        if roles_to_remove:
-            await member.remove_roles(*roles_to_remove, reason="出席率バッチ処理")
+        if actual_roles_to_remove:
+            await member.remove_roles(*actual_roles_to_remove, reason="出席率システム: 古いロールの剥奪")
+            log_messages.append(f"✅ 剥奪成功: {', '.join([r.name for r in actual_roles_to_remove])}")
+
         if role_to_add and role_to_add not in member.roles:
-            await member.add_roles(role_to_add, reason="出席率バッチ処理")
+            await member.add_roles(role_to_add, reason="出席率システム: 新しいロールの付与")
+            log_messages.append(f"✅ 付与成功: {role_to_add.name}")
+
     except discord.Forbidden:
-        print(f"ロール変更権限がありません: {guild.name}")
+        err_msg = "❌ 権限エラー(Forbidden): Botのロールが対象ロールより下に配置されているか、ロール管理権限がありません。"
+        log_messages.append(err_msg)
+    except Exception as e:
+        err_msg = f"❌ 予期せぬエラー: {str(e)}"
+        log_messages.append(err_msg)
+
+    final_log = "\n".join(log_messages)
+    print(f"[{member.display_name}] {final_log}")
+    return rate, attended, total, final_log
 
 
 # --- スラッシュコマンド ---
-@bot.tree.command(name="attendance", description="現在の出席率を確認します")
+@bot.tree.command(name="attendance", description="現在の出席率を確認し、ロールを更新します")
 async def attendance(interaction: discord.Interaction, target_user: discord.Member = None):
-    # 処理に少し時間がかかる可能性があるため、先に「考え中」状態にしてエラーを防ぐ
     await interaction.response.defer()
 
     user = target_user or interaction.user
     today = datetime.now(JST).date()
     threshold = await bot.db.get_threshold(interaction.guild.id)
     
-    # ★追加: コマンド実行時に、そのユーザーのロール更新処理を即時実行する
-    await update_member_role(user, interaction.guild, today, threshold)
-
-    # ロール更新後に計算結果を取得して表示
-    rate, attended, total = await calculate_attendance(user, interaction.guild, today, threshold)
+    # 計算とロール更新を同時に実行し、ログを取得
+    rate, attended, total, log_msg = await update_member_role(user, interaction.guild, today, threshold)
     
     embed = discord.Embed(title=f"📊 {user.display_name} の出席率", color=discord.Color.blue())
     embed.add_field(name="出席率", value=f"**{rate:.1f}%**", inline=False)
     embed.add_field(name="出席日数 / 総日数", value=f"{attended}日 / {total}日", inline=False)
-    embed.set_footer(text=f"規定時間: 1日{threshold}分以上")
     
-    # defer() を使った場合は followup.send で送信する
+    # 実行結果・エラーログをEmbedに表示
+    embed.add_field(name="⚙️ ロール更新ステータス", value=f"```\n{log_msg}\n```", inline=False)
+    
+    embed.set_footer(text=f"規定時間: 1日{threshold}分以上")
     await interaction.followup.send(embed=embed)
 
 
@@ -245,7 +269,6 @@ async def override_attendance(interaction: discord.Interaction, target_user: dis
         await interaction.response.send_message("❌ 日付の形式が正しくありません。`YYYY-MM-DD` で入力してください。", ephemeral=True)
         return
 
-    # ★ここでも再参加者対策の開始日補正を行う
     records = await bot.db.get_user_attendance(target_user.id, interaction.guild.id)
     bot_start = datetime.strptime(CONFIG['bot_start_date'], "%Y-%m-%d").date()
     member_join = target_user.joined_at.astimezone(JST).date() if target_user.joined_at else bot_start
@@ -265,13 +288,12 @@ async def override_attendance(interaction: discord.Interaction, target_user: dis
     await bot.db.set_override(target_user.id, interaction.guild.id, date_obj, status.value)
     
     threshold = await bot.db.get_threshold(interaction.guild.id)
-    await update_member_role(target_user, interaction.guild, datetime.now(JST).date(), threshold)
+    # 上書き後にロールを再計算して更新
+    _, _, _, log_msg = await update_member_role(target_user, interaction.guild, datetime.now(JST).date(), threshold)
 
-    await interaction.response.send_message(f"✅ {target_user.display_name} の `{target_date}` の記録を **{status.name}** に上書きしました。")
+    await interaction.response.send_message(f"✅ {target_user.display_name} の `{target_date}` の記録を **{status.name}** に上書きしました。\n```\n{log_msg}\n```")
 
 
 if __name__ == "__main__":
-    # Uptime Robot用Webサーバーを別スレッドで起動
     start_web_server()
-    # Bot起動
     bot.run(DISCORD_TOKEN)
