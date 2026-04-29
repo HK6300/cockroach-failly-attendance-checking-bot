@@ -91,7 +91,6 @@ async def midnight_batch_process():
         for member in guild.members:
             if member.bot:
                 continue
-            # バッチ処理時はログを標準出力に流す
             await update_member_role(member, guild, yesterday, threshold)
     print("--- [0時バッチ処理終了] ---\n")
 
@@ -151,15 +150,27 @@ async def calculate_attendance(member: discord.Member, guild: discord.Guild, tar
     return min(rate, 100.0), attended_days, total_valid_days
 
 async def update_member_role(member: discord.Member, guild: discord.Guild, target_date: date, threshold: int):
-    """
-    メンバーのロールを更新し、結果と詳細なログメッセージを返す
-    """
     rate, attended, total = await calculate_attendance(member, guild, target_date, threshold)
 
+    # 現在持っているロールの中で最もパーセントが高いものを探す
+    old_percent = 0
+    old_role_name = "なし"
+    for r in member.roles:
+        for cfg in CONFIG['roles']:
+            if r.name == cfg['name']:
+                if cfg['min_percent'] > old_percent:
+                    old_percent = cfg['min_percent']
+                    old_role_name = cfg['name']
+
+    # 新しく付与するべきロールを判定
     target_role_name = None
+    new_percent = 0
+    new_role_name = "なし"
     for role_cfg in sorted(CONFIG['roles'], key=lambda x: x['min_percent'], reverse=True):
         if rate >= role_cfg['min_percent']:
             target_role_name = role_cfg['name']
+            new_percent = role_cfg['min_percent']
+            new_role_name = role_cfg['name']
             break
 
     all_role_names = [r['name'] for r in CONFIG['roles']]
@@ -175,14 +186,10 @@ async def update_member_role(member: discord.Member, guild: discord.Guild, targe
             else:
                 roles_to_remove.append(r)
 
-    # --- ログメッセージ構築開始 ---
     log_messages = []
-    log_messages.append(f"対象ロール: {target_role_name or '該当なし'}")
-
     if target_role_name and not server_has_target_role:
-        log_messages.append(f"⚠️ エラー: '{target_role_name}' という名前のロールがサーバーに存在しません。config.jsonと完全に一致しているか確認してください。")
+        log_messages.append(f"⚠️ エラー: '{target_role_name}' という名前のロールがサーバーに存在しません。")
 
-    # 実際に剥奪・付与が必要なロールだけを抽出
     actual_roles_to_remove = [r for r in roles_to_remove if r in member.roles]
     needs_update = False
 
@@ -193,33 +200,34 @@ async def update_member_role(member: discord.Member, guild: discord.Guild, targe
 
     if not needs_update:
         if target_role_name and server_has_target_role:
-            log_messages.append("ℹ️ ロールの変更は不要です (既に付与済み)")
+            log_messages.append(f"ℹ️ 維持 ({new_role_name})")
         elif not target_role_name:
-            log_messages.append("ℹ️ ロールの変更は不要です (基準に未達)")
+            log_messages.append("ℹ️ 基準に未達")
         
         final_log = "\n".join(log_messages)
-        print(f"[{member.display_name}] {final_log}")
         return rate, attended, total, final_log
 
-    # --- 実際のロール付与・剥奪処理 ---
+    # 権限エラーを防ぐための実際の付与・剥奪処理
     try:
         if actual_roles_to_remove:
             await member.remove_roles(*actual_roles_to_remove, reason="出席率システム: 古いロールの剥奪")
-            log_messages.append(f"✅ 剥奪成功: {', '.join([r.name for r in actual_roles_to_remove])}")
-
         if role_to_add and role_to_add not in member.roles:
             await member.add_roles(role_to_add, reason="出席率システム: 新しいロールの付与")
-            log_messages.append(f"✅ 付与成功: {role_to_add.name}")
+
+        # ★ 昇格・降格の判定とログ作成
+        if new_percent > old_percent:
+            log_messages.append(f"🎉 昇格！ ({old_role_name} ➔ {new_role_name})")
+        elif new_percent < old_percent:
+            log_messages.append(f"📉 降格... ({old_role_name} ➔ {new_role_name})")
+        else:
+            log_messages.append(f"🔄 更新 ({old_role_name} ➔ {new_role_name})")
 
     except discord.Forbidden:
-        err_msg = "❌ 権限エラー(Forbidden): Botのロールが対象ロールより下に配置されているか、ロール管理権限がありません。"
-        log_messages.append(err_msg)
+        log_messages.append("❌ 権限エラー: Botのロールが対象ロールより下か、管理権限がありません。")
     except Exception as e:
-        err_msg = f"❌ 予期せぬエラー: {str(e)}"
-        log_messages.append(err_msg)
+        log_messages.append(f"❌ 予期せぬエラー: {str(e)}")
 
     final_log = "\n".join(log_messages)
-    print(f"[{member.display_name}] {final_log}")
     return rate, attended, total, final_log
 
 
@@ -232,17 +240,95 @@ async def attendance(interaction: discord.Interaction, target_user: discord.Memb
     today = datetime.now(JST).date()
     threshold = await bot.db.get_threshold(interaction.guild.id)
     
-    # 計算とロール更新を同時に実行し、ログを取得
     rate, attended, total, log_msg = await update_member_role(user, interaction.guild, today, threshold)
     
     embed = discord.Embed(title=f"📊 {user.display_name} の出席率", color=discord.Color.blue())
     embed.add_field(name="出席率", value=f"**{rate:.1f}%**", inline=False)
     embed.add_field(name="出席日数 / 総日数", value=f"{attended}日 / {total}日", inline=False)
-    
-    # 実行結果・エラーログをEmbedに表示
     embed.add_field(name="⚙️ ロール更新ステータス", value=f"```\n{log_msg}\n```", inline=False)
-    
     embed.set_footer(text=f"規定時間: 1日{threshold}分以上")
+    
+    await interaction.followup.send(embed=embed)
+
+
+# ★ 新規追加: 欠席日をリストアップするコマンド
+@bot.tree.command(name="absent_days", description="指定したユーザーの「欠席した日(規定時間未達)」を列挙します")
+async def absent_days(interaction: discord.Interaction, target_user: discord.Member = None):
+    await interaction.response.defer()
+    
+    user = target_user or interaction.user
+    guild = interaction.guild
+    threshold = await bot.db.get_threshold(guild.id)
+    
+    # 対象期間は「参加日」から「昨日」までとする（今日の分はまだ未確定のため）
+    yesterday = datetime.now(JST).date() - timedelta(days=1)
+    
+    records = await bot.db.get_user_attendance(user.id, guild.id)
+    bot_start = datetime.strptime(CONFIG['bot_start_date'], "%Y-%m-%d").date()
+    member_join = user.joined_at.astimezone(JST).date() if user.joined_at else bot_start
+
+    if records:
+        oldest_record_date = min(r['record_date'] for r in records)
+        member_start = min(member_join, oldest_record_date)
+    else:
+        member_start = member_join
+
+    start_date = max(bot_start, member_start)
+
+    if yesterday < start_date:
+        await interaction.followup.send("集計できる過去の期間がありません（今日参加したばかりなど）。")
+        return
+
+    weekdays_exclude = CONFIG['exclude_days']['weekdays']
+    holidays_exclude = [datetime.strptime(d, "%Y-%m-%d").date() for d in CONFIG['exclude_days']['holidays']]
+
+    # 検索を早くするために辞書化
+    record_dict = {r['record_date']: r for r in records}
+    
+    absent_list = []
+    current = start_date
+    while current <= yesterday:
+        # 休日は除外
+        if current.weekday() in weekdays_exclude or current in holidays_exclude:
+            current += timedelta(days=1)
+            continue
+        
+        is_attended = False
+        if current in record_dict:
+            r = record_dict[current]
+            if r['is_override']:
+                if r['override_status'] == 'attended':
+                    is_attended = True
+            else:
+                if r['total_minutes'] >= threshold:
+                    is_attended = True
+        
+        if not is_attended:
+            mins = record_dict[current]['total_minutes'] if current in record_dict else 0
+            absent_list.append(f"`{current.strftime('%Y-%m-%d')}` (滞在: {mins}分)")
+            
+        current += timedelta(days=1)
+        
+    embed = discord.Embed(title=f"📅 {user.display_name} の欠席日一覧", color=discord.Color.red())
+    embed.description = f"対象期間: `{start_date.strftime('%Y-%m-%d')}` ～ `{yesterday.strftime('%Y-%m-%d')}`"
+    
+    if not absent_list:
+        embed.add_field(name="欠席日", value="欠席日はありません！皆勤です🎉")
+    else:
+        # Discordの文字数制限(1024文字/フィールド)対策
+        chunk = ""
+        field_count = 1
+        for item in absent_list:
+            if len(chunk) + len(item) + 1 > 1000:
+                embed.add_field(name=f"欠席日 ({field_count})", value=chunk, inline=False)
+                chunk = item + "\n"
+                field_count += 1
+            else:
+                chunk += item + "\n"
+        if chunk:
+            embed.add_field(name=f"欠席日 ({field_count})", value=chunk, inline=False)
+
+    embed.set_footer(text=f"合計欠席日数: {len(absent_list)}日 / 規定時間: {threshold}分")
     await interaction.followup.send(embed=embed)
 
 
@@ -286,9 +372,7 @@ async def override_attendance(interaction: discord.Interaction, target_user: dis
         return
 
     await bot.db.set_override(target_user.id, interaction.guild.id, date_obj, status.value)
-    
     threshold = await bot.db.get_threshold(interaction.guild.id)
-    # 上書き後にロールを再計算して更新
     _, _, _, log_msg = await update_member_role(target_user, interaction.guild, datetime.now(JST).date(), threshold)
 
     await interaction.response.send_message(f"✅ {target_user.display_name} の `{target_date}` の記録を **{status.name}** に上書きしました。\n```\n{log_msg}\n```")

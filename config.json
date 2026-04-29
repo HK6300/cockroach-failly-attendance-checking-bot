@@ -2,8 +2,8 @@
   "bot_start_date": "2026-04-27",
   "roles":[
     {"name": "🪳真のファミリー🪳(参加率90%以上)", "min_percent": 90},
-    {"name": "ファミリー(参加率70%以上)", "min_percent": 70},
-    {"name": "渋い(参加率40%以上)", "min_percent": 40},
+    {"name": "ファミリー(参加率60%以上)", "min_percent": 60},
+    {"name": "渋い(参加率30%以上)", "min_percent": 30},
     {"name": "ファミリー失格🤮", "min_percent": 0}
   ],
   "exclude_days": {
