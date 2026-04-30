@@ -152,7 +152,6 @@ async def calculate_attendance(member: discord.Member, guild: discord.Guild, tar
 async def update_member_role(member: discord.Member, guild: discord.Guild, target_date: date, threshold: int):
     rate, attended, total = await calculate_attendance(member, guild, target_date, threshold)
 
-    # 現在持っているロールの中で最もパーセントが高いものを探す
     old_percent = 0
     old_role_name = "なし"
     for r in member.roles:
@@ -162,7 +161,6 @@ async def update_member_role(member: discord.Member, guild: discord.Guild, targe
                     old_percent = cfg['min_percent']
                     old_role_name = cfg['name']
 
-    # 新しく付与するべきロールを判定
     target_role_name = None
     new_percent = 0
     new_role_name = "なし"
@@ -207,14 +205,12 @@ async def update_member_role(member: discord.Member, guild: discord.Guild, targe
         final_log = "\n".join(log_messages)
         return rate, attended, total, final_log
 
-    # 権限エラーを防ぐための実際の付与・剥奪処理
     try:
         if actual_roles_to_remove:
             await member.remove_roles(*actual_roles_to_remove, reason="出席率システム: 古いロールの剥奪")
         if role_to_add and role_to_add not in member.roles:
             await member.add_roles(role_to_add, reason="出席率システム: 新しいロールの付与")
 
-        # ★ 昇格・降格の判定とログ作成
         if new_percent > old_percent:
             log_messages.append(f"🎉 昇格！ ({old_role_name} ➔ {new_role_name})")
         elif new_percent < old_percent:
@@ -251,7 +247,6 @@ async def attendance(interaction: discord.Interaction, target_user: discord.Memb
     await interaction.followup.send(embed=embed)
 
 
-# ★ 新規追加: 欠席日をリストアップするコマンド
 @bot.tree.command(name="absent_days", description="指定したユーザーの「欠席した日(規定時間未達)」を列挙します")
 async def absent_days(interaction: discord.Interaction, target_user: discord.Member = None):
     await interaction.response.defer()
@@ -260,9 +255,7 @@ async def absent_days(interaction: discord.Interaction, target_user: discord.Mem
     guild = interaction.guild
     threshold = await bot.db.get_threshold(guild.id)
     
-    # 対象期間は「参加日」から「昨日」までとする（今日の分はまだ未確定のため）
     yesterday = datetime.now(JST).date() - timedelta(days=1)
-    
     records = await bot.db.get_user_attendance(user.id, guild.id)
     bot_start = datetime.strptime(CONFIG['bot_start_date'], "%Y-%m-%d").date()
     member_join = user.joined_at.astimezone(JST).date() if user.joined_at else bot_start
@@ -282,13 +275,11 @@ async def absent_days(interaction: discord.Interaction, target_user: discord.Mem
     weekdays_exclude = CONFIG['exclude_days']['weekdays']
     holidays_exclude = [datetime.strptime(d, "%Y-%m-%d").date() for d in CONFIG['exclude_days']['holidays']]
 
-    # 検索を早くするために辞書化
     record_dict = {r['record_date']: r for r in records}
     
     absent_list = []
     current = start_date
     while current <= yesterday:
-        # 休日は除外
         if current.weekday() in weekdays_exclude or current in holidays_exclude:
             current += timedelta(days=1)
             continue
@@ -315,7 +306,6 @@ async def absent_days(interaction: discord.Interaction, target_user: discord.Mem
     if not absent_list:
         embed.add_field(name="欠席日", value="欠席日はありません！皆勤です🎉")
     else:
-        # Discordの文字数制限(1024文字/フィールド)対策
         chunk = ""
         field_count = 1
         for item in absent_list:
@@ -329,6 +319,40 @@ async def absent_days(interaction: discord.Interaction, target_user: discord.Mem
             embed.add_field(name=f"欠席日 ({field_count})", value=chunk, inline=False)
 
     embed.set_footer(text=f"合計欠席日数: {len(absent_list)}日 / 規定時間: {threshold}分")
+    await interaction.followup.send(embed=embed)
+
+
+# ★ 新規追加: 総滞在時間を表示するコマンド
+@bot.tree.command(name="total_time", description="指定したユーザーの総VC滞在時間(累計)を表示します")
+async def total_time(interaction: discord.Interaction, target_user: discord.Member = None):
+    await interaction.response.defer()
+    
+    user = target_user or interaction.user
+    guild = interaction.guild
+    
+    # 過去にDBへ記録された合計分数を取得
+    records = await bot.db.get_user_attendance(user.id, guild.id)
+    total_minutes = sum(r['total_minutes'] for r in records)
+    
+    # 今現在VCにいる場合、リアルタイムの入室分数を加算
+    current_vc_users = await bot.db.get_all_current_vc()
+    current_record = next((r for r in current_vc_users if r['user_id'] == user.id), None)
+    
+    if current_record:
+        join_time = current_record['join_time'].astimezone(JST)
+        now = datetime.now(JST)
+        duration = int((now - join_time).total_seconds() // 60)
+        total_minutes += duration
+        
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    
+    embed = discord.Embed(title=f"⏱️ {user.display_name} の総VC滞在時間", color=discord.Color.green())
+    embed.description = f"**{hours} 時間 {minutes} 分**\n(累計: {total_minutes} 分)"
+    
+    if current_record:
+        embed.set_footer(text="※現在VC滞在中のため、リアルタイムの時間を加算して表示しています")
+         
     await interaction.followup.send(embed=embed)
 
 
