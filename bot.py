@@ -322,7 +322,6 @@ async def absent_days(interaction: discord.Interaction, target_user: discord.Mem
     await interaction.followup.send(embed=embed)
 
 
-# ★ 新規追加: 総滞在時間を表示するコマンド
 @bot.tree.command(name="total_time", description="指定したユーザーの総VC滞在時間(累計)を表示します")
 async def total_time(interaction: discord.Interaction, target_user: discord.Member = None):
     await interaction.response.defer()
@@ -330,11 +329,9 @@ async def total_time(interaction: discord.Interaction, target_user: discord.Memb
     user = target_user or interaction.user
     guild = interaction.guild
     
-    # 過去にDBへ記録された合計分数を取得
     records = await bot.db.get_user_attendance(user.id, guild.id)
     total_minutes = sum(r['total_minutes'] for r in records)
     
-    # 今現在VCにいる場合、リアルタイムの入室分数を加算
     current_vc_users = await bot.db.get_all_current_vc()
     current_record = next((r for r in current_vc_users if r['user_id'] == user.id), None)
     
@@ -353,6 +350,70 @@ async def total_time(interaction: discord.Interaction, target_user: discord.Memb
     if current_record:
         embed.set_footer(text="※現在VC滞在中のため、リアルタイムの時間を加算して表示しています")
          
+    await interaction.followup.send(embed=embed)
+
+
+# ★ 新規追加: ランキングを表示するコマンド
+@bot.tree.command(name="ranking", description="メンバーの総VC滞在時間ランキングを表示します")
+async def ranking(interaction: discord.Interaction):
+    await interaction.response.defer()
+    guild = interaction.guild
+
+    # 1. ギルド全体の累計データを一括取得（サーバーへの負荷軽減のため直接SQL実行）
+    async with bot.db.pool.acquire() as conn:
+        records = await conn.fetch('''
+            SELECT user_id, SUM(total_minutes) as total
+            FROM daily_attendance 
+            WHERE guild_id = $1 
+            GROUP BY user_id
+        ''', guild.id)
+        
+    total_times = {r['user_id']: r['total'] for r in records}
+
+    # 2. 現在VCにいるユーザーのリアルタイム時間を加算
+    current_vc_users = await bot.db.get_all_current_vc()
+    now = datetime.now(JST)
+    for r in current_vc_users:
+        if r['guild_id'] == guild.id:
+            uid = r['user_id']
+            join_time = r['join_time'].astimezone(JST)
+            duration = int((now - join_time).total_seconds() // 60)
+            total_times[uid] = total_times.get(uid, 0) + duration
+
+    # 3. 現在サーバーにいるメンバーと紐付け
+    ranking_data = []
+    for member in guild.members:
+        if member.bot:
+            continue
+        t = total_times.get(member.id, 0)
+        if t > 0:
+            ranking_data.append((member, t))
+
+    # 降順ソート（滞在時間が長い順）
+    ranking_data.sort(key=lambda x: x[1], reverse=True)
+
+    if not ranking_data:
+        await interaction.followup.send("まだVCの滞在記録がありません。")
+        return
+
+    embed = discord.Embed(title=f"🏆 {guild.name} VC滞在時間ランキング", color=discord.Color.gold())
+    
+    description = ""
+    # 上位15名を表示 (Discordの文字数制限対策)
+    for i, (member, t) in enumerate(ranking_data[:15], 1):
+        hours = t // 60
+        mins = t % 60
+        
+        if i == 1: medal = "🥇"
+        elif i == 2: medal = "🥈"
+        elif i == 3: medal = "🥉"
+        else: medal = f"`{i}.`"
+        
+        description += f"{medal} **{member.display_name}** : {hours}時間{mins}分\n"
+        
+    embed.description = description
+    embed.set_footer(text=f"全 {len(ranking_data)} 名中 上位15名を表示 / リアルタイム反映済")
+    
     await interaction.followup.send(embed=embed)
 
 
